@@ -1,0 +1,204 @@
+---
+title: "Clustering growth curves"
+author: "JM Nunes"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Preamble
+
+This source document is intended to be run with **RStudio**.
+
+This document requires some not too old **R** installation (if case of problem see session details at bottom), and a few packages that are not always installed by default, namely: ggplot2, reshape2, ggfortify, factoextra. Install them if necessary.
+
+Finally, the data is supposed to be in a **data** directory in **protein_name.csv** files (one per protein).
+
+## Data acquisition
+
+The data is stored in the directory data. The list of files is
+
+```{r}
+files_to_read <- 
+  list.files(path='data', pattern='\\.csv$', full.names=TRUE)
+files_to_read <- files_to_read[-c(15,16)]
+files_to_read
+```
+
+We start by reading a single file
+
+```{r}
+read_one_file <- function(filename) {
+  temp_df <- read.table(filename, header=TRUE, sep=',')
+  names(temp_df) <- c('tubulin', 'length')
+  temp_df$protein <- factor(gsub('.*/(.*)\\.csv', '\\1', filename))
+  temp_df
+}
+test1 <- read_one_file(files_to_read[1])
+summary(test1)
+```
+
+The data seems correct, we read all files (Map) and combine them (Reduce) into a single file.
+
+```{r}
+growth <- Reduce(rbind, Map(read_one_file, files_to_read))
+str(growth)
+summary(growth)
+```
+
+We look at the distribution of protein lengths.
+
+```{r}
+library(ggplot2)
+ggplot(data=growth, aes(tubulin, length)) + geom_line() +
+  facet_wrap(~protein)
+```
+
+## Smoothing
+
+To reduce the irregularities inherent to theis kind of data and facilitate comparability, we look for a smoothed version of each protein's growth curve. For that we calculate the loess fit of each protein and then apply this fit to a grid of evenly spaced tubulin lengths.
+
+```{r}
+growth_by_prot <- split(growth, growth$protein)
+
+make_loess_for_prot <- function(prot) loess(data=prot, length ~ tubulin)
+
+growth_loess <- Map(make_loess_for_prot, growth_by_prot)
+
+# points spaced by 10, between 30 and 600 ### maybe this needs some justification
+create_tub_grid <- function(start=30, stop=600, step=10) 
+  data.frame(tubulin=seq(start, stop, step))
+tub.grid <- create_tub_grid(stop=500) 
+
+predict_loess_for_prot.slice <- function(protfit) {
+  # range m,M of tubulin lengths for current protein
+  m <- min(protfit$x)
+  M <- max(protfit$x) 
+  aux <- tub.grid[ !( tub.grid$tubulin < m | tub.grid$tubulin > M ), ]
+  data.frame(tubulin=aux, length=predict(protfit, newdata=aux))
+  }
+
+predict_loess_for_prot <- predict_loess_for_prot.slice
+  
+growth_smoothed <- Map(predict_loess_for_prot, growth_loess)
+```
+
+### Graphical check
+
+#### Current data
+
+```{r}
+growth_smoothed_df <- 
+  Reduce(rbind,
+    Map(cbind, growth_smoothed, protein=names(growth_smoothed)))
+
+ggplot(data=growth, aes(tubulin, length)) + geom_line() +
+  geom_line(data=growth_smoothed_df, colour='red', aes(tubulin, length), alpha=0.5) +
+  facet_wrap(~protein)
+```
+
+## Averaging distance
+
+We calculate the manhattan distance between the smoothed curves of two proteins, that is, the sum of the absolute differences of their lengths on the smoothed fit at the points of the grid where both the curves are defined.
+
+```{r}
+str(growth_smoothed_df)
+summary(growth_smoothed_df)
+prot_lengths_wide <- reshape2::dcast(growth_smoothed_df,  protein ~  tubulin, value.var='length')
+# growth_smoothed_df[duplicated(growth_smoothed_df),]   ### this is ok now
+summary(prot_lengths_wide)
+
+prot_dists <- {
+  aux <- dist(prot_lengths_wide, method='manha')
+  aux <- as.matrix(aux) 
+  dimnames(aux) <- list(prot_lengths_wide$protein, prot_lengths_wide$protein)
+  as.dist(aux)
+}
+```
+
+A visual check using NMDS (preserves local distance structure better than PCA)
+
+```{r}
+library(ggfortify)
+autoplot(MASS::sammon(prot_dists), label=TRUE, label.repel=TRUE) 
+```
+
+## Normalisation
+
+The distances as calculated above make a proportional resizing for the independent (tubulin grid) lengths not present. According to the R documentation: \> ... If some columns are excluded in calculating a Euclidean, Manhattan, Canberra or Minkowski distance, the sum is scaled up proportionally to the number of columns used. If all pairs are excluded when calculating a particular distance, the value is NA.
+
+This affects distances because some proteins are not present all along the tubulin grid lengths. Some normalisation seems required. In order to normalise the values we need the get start and stop points for each protein, and protein pairs thereof. The average the manhattan distances over the common tubulin range. \#### curr data
+
+```{r}
+
+prot_limits <- {
+  x0 <- aggregate(data=growth_smoothed_df, tubulin ~ protein, \(x) c(min(x), max(x)))
+  x1 <- data.frame(protein=x0[[1]], min=x0[[2]][,1], max=x0[[2]][,2])
+  x1
+  }
+
+prot_pairs_limits <- {
+  x0 <- expand.grid(prot_limits$protein, prot_limits$protein, stringsAsFactors=FALSE)
+  x0 <- x0[x0$Var1 >= x0$Var2,]
+  get_prot_pairs_limits <- function(x,y) {
+    x1 <- prot_limits[prot_limits$protein %in% c(x,y),]
+    data.frame(Var1=x, Var2=y, min=max(x1$min), max=min(x1$max))
+  }
+  Reduce(rbind, Map(get_prot_pairs_limits, x0$Var1, x0$Var2))
+}
+
+prot_pairs_dists <- {
+  pair_dist <- function(x, y, m, M) {
+    if (x == y) return(0)
+    x0 <- growth_smoothed_df
+    x0 <- x0[x0$protein %in% c(x, y) & x0$tubulin >= m & x0$tubulin <= M, ]
+    x1 <- aggregate(data=x0, length ~ tubulin, \(x) abs(diff(x)))
+    sum(x1$length) / (M-m)
+  }
+  cbind(
+    prot_pairs_limits,
+    dist=unlist(Map(pair_dist, prot_pairs_limits$Var1, prot_pairs_limits$Var2, prot_pairs_limits$min, prot_pairs_limits$max))
+  )
+}
+prot_dists_norm <- as.dist(t(as.matrix.data.frame(reshape2::dcast(data=prot_pairs_dists, Var2 ~ Var1, value.var='dist')[,-1])))
+```
+
+## Cluster analysis
+
+### How many clusters to use?
+
+```{r include=FALSE}
+library(factoextra)
+```
+
+```{r out.width='30%', fig.show='hold'}
+library(cluster)
+library(factoextra)
+prot_dists_df <- as.matrix(prot_dists_norm)
+#rownames(prot_dists_df) <- 
+#  rownames(prot_dists_df) <- levels(growth$protein)
+fviz_nbclust(prot_dists_df, pam, 'wss')
+fviz_nbclust(prot_dists_df, pam, 'silhouette')
+fviz_nbclust(prot_dists_df, pam, 'gap_stat')
+```
+
+Combining the results above it seems reasonable to go with 2 or 7 clusters. We'll look at the representations for a final decision.
+
+```{r width=7, height=7}
+fviz_cluster(pam(prot_dists_df,7), repel=TRUE) + 
+  scale_x_reverse() +
+#  coord_fixed() +
+  theme_light() +
+  guides(fill='none', shape='none', colour='none')
+```
+
+## Colophon
+
+```{r}
+sessionInfo()
+```
